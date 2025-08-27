@@ -1,6 +1,7 @@
 def plus(x):
     return x + 1
 
+# 정한성 수정 연습
 
 class Test:
     def setup_functions(self):
