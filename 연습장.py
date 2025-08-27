@@ -42,3 +42,6 @@ t.z = 300
 print("Changed x: ", t.get_plus_x())
 print("Changed y: ", t.get_plus_y())
 print("Changed z: ", t.get_plus_z())
+
+
+print("곽명조 수정")
