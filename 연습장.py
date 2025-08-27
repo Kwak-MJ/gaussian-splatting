@@ -46,4 +46,4 @@ print("Changed z: ", t.get_plus_z())
 
 print("곽명조 수정")
 print("곽명조 수정 version2")
-
+print("곽명조 수정 version3")
