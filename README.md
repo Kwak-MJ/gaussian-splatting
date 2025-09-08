@@ -200,7 +200,7 @@ To run the render.py, use one out of two below
 ```shell
 python render.py -m <path to trained model> --render_mask True # if you trained with render_mask=True, it can be also set True in render.py (you will get rendered mirror mask)
 
-python train.py -s <path to COLMAP or NeRF Synthetic dataset> # if you trained with render_mask=False, you must set False in render.py (Although you trained with render_mask=True, you can set False if you want to)
+python render.py -m <path to trained model> # if you trained with render_mask=False, you must set False in render.py (Although you trained with render_mask=True, you can set False if you want to)
 
 ```
 <details>
