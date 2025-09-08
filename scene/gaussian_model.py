@@ -21,6 +21,8 @@ from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
+from utils import ransac
+import trimesh
 
 try:
     from diff_gaussian_rasterization import SparseGaussianAdam
@@ -45,6 +47,7 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
+        self.mirror_activation = torch.sigmoid # 추가된 부분
 
 
     def __init__(self, sh_degree, optimizer_type="default"):
@@ -57,6 +60,7 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._mirror_opacity = torch.empty(0) # 추가된 부분
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -74,6 +78,7 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._opacity,
+            self._mirror_opacity, # 추가된 부분
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
@@ -89,6 +94,7 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._opacity,
+        self._mirror_opacity,  # 추가된 부분
         self.max_radii2D, 
         xyz_gradient_accum, 
         denom,
@@ -129,6 +135,11 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+    # 추가된 부분
+    @property
+    def get_mirror_opacity(self):
+        return self.mirror_activation(self._mirror_opacity) 
+    
     @property
     def get_exposure(self):
         return self._exposure
@@ -163,12 +174,16 @@ class GaussianModel:
 
         opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
 
+        # 추가된 부분
+        mirror_opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
+        self._mirror_opacity = nn.Parameter(mirror_opacities.requires_grad_(True)) # 추가된 부분
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
@@ -185,6 +200,7 @@ class GaussianModel:
             {'params': [self._features_dc], 'lr': training_args.feature_lr, "name": "f_dc"},
             {'params': [self._features_rest], 'lr': training_args.feature_lr / 20.0, "name": "f_rest"},
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
+            {'params': [self._mirror_opacity], 'lr': training_args.opacity_lr, "name": "mirror_opacity"}, # 추가된 부분
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
@@ -230,6 +246,7 @@ class GaussianModel:
         for i in range(self._features_rest.shape[1]*self._features_rest.shape[2]):
             l.append('f_rest_{}'.format(i))
         l.append('opacity')
+        l.append('mirror_opacity') # 추가된 부분
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
@@ -244,13 +261,14 @@ class GaussianModel:
         f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
+        mirror_opacities = self._mirror_opacity.detach().cpu().numpy() # 추가된 부분
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
 
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, mirror_opacities, scale, rotation), axis=1) # 추가된 부분
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -277,6 +295,7 @@ class GaussianModel:
                         np.asarray(plydata.elements[0]["y"]),
                         np.asarray(plydata.elements[0]["z"])),  axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        mirror_opacities = np.asarray(plydata.elements[0]["mirror_opacity"])[..., np.newaxis] # 추가된 부분
 
         features_dc = np.zeros((xyz.shape[0], 3, 1))
         features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
@@ -308,6 +327,7 @@ class GaussianModel:
         self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._mirror_opacity = nn.Parameter(torch.tensor(mirror_opacities, dtype=torch.float, device="cuda").requires_grad_(True))  # 추가된 부분
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
 
@@ -354,6 +374,7 @@ class GaussianModel:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
+        self._mirror_opacity = optimizable_tensors["mirror_opacity"] # 추가된 부분
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -385,11 +406,12 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_mirror_opacities, new_scaling, new_rotation, new_tmp_radii):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
+        "mirror_opacity": new_mirror_opacities, # 추가된 부분
         "scaling" : new_scaling,
         "rotation" : new_rotation}
 
@@ -398,6 +420,7 @@ class GaussianModel:
         self._features_dc = optimizable_tensors["f_dc"]
         self._features_rest = optimizable_tensors["f_rest"]
         self._opacity = optimizable_tensors["opacity"]
+        self._mirror_opacity = optimizable_tensors["mirror_opacity"] # 추가된 부분
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
 
@@ -425,9 +448,10 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N,1,1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
+        new_mirror_opacity = self._mirror_opacity[selected_pts_mask].repeat(N,1) # 추가된 부분
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_mirror_opacity, new_scaling, new_rotation, new_tmp_radii) # 추가된 부분, 인자
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -442,12 +466,13 @@ class GaussianModel:
         new_features_dc = self._features_dc[selected_pts_mask]
         new_features_rest = self._features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
+        new_mirror_opacity = self._mirror_opacity[selected_pts_mask] # 추가된 부분
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_mirror_opacity, new_scaling, new_rotation, new_tmp_radii) # 추가된 부분, 인자
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
         grads = self.xyz_gradient_accum / self.denom
@@ -471,3 +496,50 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    # 추가된 부분, 함수
+    @torch.no_grad()
+    def compute_mirror_plane(self, min_opacity, sansac_threshold=0.01):
+        # Mirror에 해당 + 기준점 이상의 밀도를 지닌 point를 선정
+        valid_points_mask = (self.get_mirror_opacity > min_opacity).squeeze() & (self.get_opacity > min_opacity).squeeze()
+        mirror_xyz = self._xyz[valid_points_mask]
+        
+        # 충분한 점이 있는지 확인
+        # if len(mirror_xyz) < 3:
+        #     print(f"Warning: Not enough mirror points ({len(mirror_xyz)}) for plane computation. Need at least 3 points.")
+        #     # 기본 평면 방정식 반환 (z=0 평면)
+        #     self.mirror_equ = np.array([0.0, 0.0, 1.0, 0.0])
+        #     return self.mirror_equ
+        
+        self.mirror_equ, mirror_pts_ids = ransac.Plane(mirror_xyz.detach().cpu().numpy(), sansac_threshold)
+
+        # Mirror transformation
+        # a, b, c, d = self.mirror_equ[0], self.mirror_equ[1], self.mirror_equ[2], self.mirror_equ[3]
+        # mirror_transform = np.array([
+        #     1-2*a*a, -2*a*b, -2*a*c, -2*a*d, 
+        #     -2*a*b, 1-2*b*b, -2*b*c, -2*b*d, 
+        #     -2*a*c, -2*b*c, 1-2*c*c, -2*c*d, 
+        #     0, 0, 0, 1
+        # ]).reshape(4, 4) # 평면 기준 대칭, 평면 반사 구현, R, T, Homogeneous coord 적용
+
+        # mirror_transform = torch.as_tensor(mirror_transform, dtype=torch.float, device="cuda")
+   
+        return self.mirror_equ # [a, b, c, d]
+    
+    # 추가된 부분, 함수
+    # train.py 에서 compute_mirror_plane()은 10000iteration에서 1번 수행
+    # 따라서 이후 학습 과정에서 mirror plane이 일정하도록 강제하기 위함
+    def get_plane_error(self, save_mirror_path=None, min_opacity=0.5):
+        """enforcing the mirror points close to the plane"""
+        valid_points_mask = (self.get_mirror_opacity > min_opacity).squeeze() & (self.get_opacity > min_opacity).squeeze()
+        mirror_xyz = self._xyz[valid_points_mask] 
+
+        if save_mirror_path is not None: 
+            trimesh.points.PointCloud(mirror_xyz.detach().cpu().numpy()).export(save_mirror_path)
+
+        a, b, c, d = self.mirror_equ[0], self.mirror_equ[1], self.mirror_equ[2], self.mirror_equ[3]
+        dist = ((
+            mirror_xyz[:, 0] * a + mirror_xyz[:, 1] * b + mirror_xyz[:, 2] * c + d 
+            ) / np.sqrt(a ** 2 + b ** 2 + c ** 2)).abs() 
+
+        return dist

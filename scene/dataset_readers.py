@@ -33,6 +33,7 @@ class CameraInfo(NamedTuple):
     image_path: str
     image_name: str
     depth_path: str
+    mask_path: str  # 추가된 부분, 거울 마스크 경로 추가
     width: int
     height: int
     is_test: bool
@@ -68,7 +69,8 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, depths_folder, test_cam_names_list):
+# 추가된 부분, mask_folder 인자
+def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_folder, masks_folder, depths_folder, test_cam_names_list):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -107,11 +109,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, depths_params, images_fold
 
         image_path = os.path.join(images_folder, extr.name)
         image_name = extr.name
+        mask_path = os.path.join(masks_folder, extr.name) # 추가된 부분
         depth_path = os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png") if depths_folder != "" else ""
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, depth_params=depth_params,
-                              image_path=image_path, image_name=image_name, depth_path=depth_path,
-                              width=width, height=height, is_test=image_name in test_cam_names_list)
+                              image_path=image_path, image_name=image_name, depth_path=depth_path, mask_path=mask_path, width=width, height=height, is_test=image_name in test_cam_names_list) # 추가된 부분, mask data 위치 인자
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
@@ -194,6 +196,7 @@ def readColmapSceneInfo(path, images, depths, eval, train_test_exp, llffhold=8):
     cam_infos_unsorted = readColmapCameras(
         cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, depths_params=depths_params,
         images_folder=os.path.join(path, reading_dir), 
+        masks_folder=os.path.join(path, "masks"), # 추가된 부분
         depths_folder=os.path.join(path, depths) if depths != "" else "", test_cam_names_list=test_cam_names_list)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
@@ -250,6 +253,8 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
             image_name = Path(cam_name).stem
             image = Image.open(image_path)
 
+            mask_path = os.path.join(path, cam_name) # 추가된 부분
+
             im_data = np.array(image.convert("RGBA"))
 
             bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
@@ -266,7 +271,7 @@ def readCamerasFromTransforms(path, transformsfile, depths_folder, white_backgro
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX,
                             image_path=image_path, image_name=image_name,
-                            width=image.size[0], height=image.size[1], depth_path=depth_path, depth_params=None, is_test=is_test))
+                            width=image.size[0], height=image.size[1], mask_path=mask_path, depth_path=depth_path, depth_params=None, is_test=is_test)) # 추가된 부분
             
     return cam_infos
 

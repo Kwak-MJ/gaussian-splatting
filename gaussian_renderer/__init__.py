@@ -15,7 +15,8 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
+# 추가된 부분, render_mirror_mask 인자 추가
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, render_mirror_mask=False):
     """
     Render the scene. 
     
@@ -125,4 +126,34 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         "depth" : depth_image
         }
     
+    ### 추가된 부분 ###
+    # 필요한 경우, 기존 opacity rendering에서 mirror opacity rendering으로 변경
+    if render_mirror_mask:
+        mirror_opacity = pc.get_mirror_opacity
+        white_color = torch.ones((means3D.shape[0], 3), device="cuda", dtype=torch.float32)
+        if separate_sh:
+            mirror_image, _, _ = rasterizer(
+                means3D = means3D,
+                means2D = means2D,
+                dc = dc,
+                shs = None,
+                colors_precomp = white_color,
+                opacities = mirror_opacity,
+                scales = scales,
+                rotations = rotations,
+                cov3D_precomp = cov3D_precomp)
+        else:
+            mirror_image, _, _ = rasterizer(
+                means3D = means3D,
+                means2D = means2D,
+                shs = None,
+                colors_precomp = white_color,
+                opacities = mirror_opacity,
+                scales = scales,
+                rotations = rotations,
+                cov3D_precomp = cov3D_precomp)
+        
+        out["mirror_mask"] = mirror_image.clamp(0, 1)
+    ######
+
     return out
