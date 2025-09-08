@@ -12,16 +12,17 @@
 import torch
 from torch import nn
 import numpy as np
+import os # 추가된 부분
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
 from utils.general_utils import PILtoTorch
 import cv2
 
 class Camera(nn.Module):
     def __init__(self, resolution, colmap_id, R, T, FoVx, FoVy, depth_params, image, invdepthmap,
-                 image_name, uid,
+                 image_name, uid, mask_path = None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda",
                  train_test_exp = False, is_test_dataset = False, is_test_view = False
-                 ):
+                 ): # 추가된 부분, mask_path 인자
         super(Camera, self).__init__()
 
         self.uid = uid
@@ -56,7 +57,28 @@ class Camera(nn.Module):
         self.original_image = gt_image.clamp(0.0, 1.0).to(self.data_device)
         self.image_width = self.original_image.shape[2]
         self.image_height = self.original_image.shape[1]
-
+        
+        ### 추가된 부분 ###
+        # mirror_mask 데이터를 불러와서
+        # gt_alpha_mask 변수에 저장
+        self.gt_alpha_mask = None
+        if mask_path is not None and os.path.exists(mask_path):
+            try:
+                from PIL import Image
+                mask_image = Image.open(mask_path).convert('L')  # Convert to grayscale
+                mask_resized = PILtoTorch(mask_image, resolution)
+                self.gt_alpha_mask = mask_resized[0:1, ...].to(self.data_device)  # Take first channel and add batch dim
+                
+                # Check if already normalized (0-1) or needs normalization (0-255)
+                if self.gt_alpha_mask.max() > 1.0:
+                    # Normalize from 0-255 to 0-1 range
+                    self.gt_alpha_mask = self.gt_alpha_mask / 255.0
+                # If already 0-1 range, no normalization needed
+            except Exception as e:
+                print(f"Warning: Could not load mirror mask from {mask_path}: {e}")
+                self.gt_alpha_mask = None
+        ######
+        
         self.invdepthmap = None
         self.depth_reliable = False
         if invdepthmap is not None:

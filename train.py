@@ -40,7 +40,9 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+
+# 추가된 부분, 인자에 render_mask 추가
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, render_mask):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -57,6 +59,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+    mirror_color = torch.tensor([0,0,1], dtype=torch.float32, device="cuda").reshape(3, 1, 1) # 추가된 부분
+    inter_iteration = 10000
+
     iter_start = torch.cuda.Event(enable_timing = True)
     iter_end = torch.cuda.Event(enable_timing = True)
 
@@ -67,6 +72,11 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     viewpoint_indices = list(range(len(viewpoint_stack)))
     ema_loss_for_log = 0.0
     ema_Ll1depth_for_log = 0.0
+    
+    ### 추가된 부분 ###
+    ema_mirror_mask_for_log = 0.0 
+    ema_mirror_plane_for_log = 0.0 
+    ######
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
@@ -98,18 +108,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_indices = list(range(len(viewpoint_stack)))
-        rand_idx = randint(0, len(viewpoint_indices) - 1)
-        viewpoint_cam = viewpoint_stack.pop(rand_idx)
-        vind = viewpoint_indices.pop(rand_idx)
 
+        ### 추가된 부분 ###
+        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        ######
+        
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
+        # random background 사용안하기 
+        # bg = torch.rand((3), device="cuda") if opt.random_background else background
 
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE)
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, use_trained_exp=dataset.train_test_exp, separate_sh=SPARSE_ADAM_AVAILABLE, render_mirror_mask=render_mask) # 추가된 부분, render_mirror_mask 추가
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        
+        # renderer에서 mirror mask 불러오기
+        mirror_mask = render_pkg.get("mirror_mask", None) # 추가된 부분
 
         if viewpoint_cam.alpha_mask is not None:
             alpha_mask = viewpoint_cam.alpha_mask.cuda()
@@ -124,6 +139,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ssim_value = ssim(image, gt_image)
 
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
+        
+        ### 추가된 부분 ###
+        # Mirror plane에 대한 loss, optimization
+
+        # Mirror losses
+        mirror_mask_loss = 0.0
+        mirror_plane_loss = 0.0
+        
+        # Mirror mask 관련 loss 추가 (for first {inter_iteration} iterations)
+        if render_mask:
+            if iteration < inter_iteration and mirror_mask is not None and hasattr(viewpoint_cam, 'gt_alpha_mask'):
+                gt_mirror_mask = viewpoint_cam.gt_alpha_mask.cuda()
+                if gt_mirror_mask.shape != mirror_mask.shape:
+                    # Match dimensions - take first channel if needed
+                    if len(mirror_mask.shape) == 3 and mirror_mask.shape[0] > 1:
+                        mirror_mask_single = mirror_mask[0:1]  # Take first channel
+                    else:
+                        mirror_mask_single = mirror_mask
+                    mirror_mask_loss = l1_loss(mirror_mask_single, gt_mirror_mask)
+                else:
+                    mirror_mask_loss = l1_loss(mirror_mask, gt_mirror_mask)
+                
+                loss += 0.5 * mirror_mask_loss  # Weight for mirror mask loss
+
+            # Mirror plane constraint loss (after {inter_iteration} iterations)
+            if iteration == inter_iteration:
+                # Compute mirror plane equation using RANSAC
+                gaussians.mirror_equ = gaussians.compute_mirror_plane(min_opacity=0.5, sansac_threshold=0.01)
+                print(f"Mirror plane equation computed: {gaussians.mirror_equ}")
+                
+                # Save mirror plane equation to txt file
+                mirror_plane_file = os.path.join(scene.model_path, "mirror_plane_equations.txt")
+                with open(mirror_plane_file, 'w') as f:  # write mode (새 파일 생성)
+                    f.write(f"[{iteration}] a: {gaussians.mirror_equ[0]:.6f}, b: {gaussians.mirror_equ[1]:.6f}, c: {gaussians.mirror_equ[2]:.6f}, d: {gaussians.mirror_equ[3]:.6f}\n")
+
+            elif iteration > inter_iteration and hasattr(gaussians, 'mirror_equ'):
+                # Enforce mirror points to be close to the computed plane
+                plane_errors = gaussians.get_plane_error(min_opacity=0.5)
+                if len(plane_errors) > 0:
+                    mirror_plane_loss = plane_errors.mean()
+                    loss += 0.2 * mirror_plane_loss  # Weight for plane constraint loss
+        ######
 
         # Depth regularization
         Ll1depth_pure = 0.0
@@ -148,8 +205,21 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
             ema_Ll1depth_for_log = 0.4 * Ll1depth + 0.6 * ema_Ll1depth_for_log
 
+            ### 추가된 부분 ###
+            ema_mirror_mask_for_log = 0.4 * (mirror_mask_loss.item() if isinstance(mirror_mask_loss, torch.Tensor) else mirror_mask_loss) + 0.6 * ema_mirror_mask_for_log
+            ema_mirror_plane_for_log = 0.4 * (mirror_plane_loss.item() if isinstance(mirror_plane_loss, torch.Tensor) else mirror_plane_loss) + 0.6 * ema_mirror_plane_for_log
+            ######
+
+            ### 추가된 부분 ###
+            # progress bar에 표시하기 위한 ema
             if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Depth Loss": f"{ema_Ll1depth_for_log:.{7}f}"})
+                postfix_dict = {"Loss": f"{ema_loss_for_log:.{7}f}", "Depth": f"{ema_Ll1depth_for_log:.{7}f}"}
+                if iteration <= inter_iteration:
+                    postfix_dict["Mirror"] = f"{ema_mirror_mask_for_log:.{7}f}"
+                elif iteration > inter_iteration:
+                    postfix_dict["Plane"] = f"{ema_mirror_plane_for_log:.{7}f}"
+                progress_bar.set_postfix(postfix_dict)
+            ######
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -267,6 +337,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--render_mask", default=False, type=bool) # 추가된 부분, parser에 render_mask 추가 
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -279,7 +350,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.render_mask) # 추가된 부분, 함수 호출에 render_mask 인자 추가 
 
     # All done
     print("\nTraining complete.")
